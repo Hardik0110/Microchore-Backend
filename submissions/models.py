@@ -13,7 +13,19 @@ class Claim(models.Model):
     user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='claims')
     claimed_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField()
-    status = models.CharField(max_length=15, choices=STATUS_CHOICES, default='ACTIVE')
+    status = models.CharField(max_length=15, choices=STATUS_CHOICES, default='ACTIVE', db_index=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['task', 'user'],
+                condition=models.Q(status__in=['ACTIVE', 'SUBMITTED']),
+                name='claim_unique_active_per_task_user',
+            ),
+        ]
+        indexes = [
+            models.Index(fields=['task', 'user', 'status'], name='claim_task_user_status_idx'),
+        ]
 
     def __str__(self):
         return f"Claim by {self.user} on {self.task}"
@@ -44,7 +56,7 @@ class Submission(models.Model):
     time_to_compose_seconds = models.IntegerField(default=0)
     attestation_signed = models.BooleanField(default=False)
     ai_likelihood_score = models.DecimalField(max_digits=5, decimal_places=4, default=0.0)
-    status = models.CharField(max_length=15, choices=STATUS_CHOICES, default='PENDING')
+    status = models.CharField(max_length=15, choices=STATUS_CHOICES, default='PENDING', db_index=True)
     rating_final = models.DecimalField(max_digits=3, decimal_places=2, null=True, blank=True)
     justification = models.TextField(blank=True, default='')
     submitted_at = models.DateTimeField(auto_now_add=True)

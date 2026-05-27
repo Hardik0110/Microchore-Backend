@@ -1,13 +1,20 @@
+import hashlib
+import logging
+import secrets
 from datetime import datetime, timezone as dt_tz
 from urllib.parse import quote
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.shortcuts import redirect
 from django.utils import timezone
 from rest_framework import generics, permissions, status
 from rest_framework.response import Response
+from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from . import twitter_oauth
@@ -22,8 +29,24 @@ from .serializers import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+
+EMAIL_CODE_TTL_SECONDS = 15 * 60
+
+
+def _email_code_cache_key(user_id: int) -> str:
+    return f'email-verify:{user_id}'
+
+
+def _hash_code(code: str) -> str:
+    return hashlib.sha256(code.encode('utf-8')).hexdigest()
+
+
 class SignupView(APIView):
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth_signup'
 
     def post(self, request):
         serializer = SignupSerializer(data=request.data)
@@ -34,6 +57,8 @@ class SignupView(APIView):
 
 class GoogleSignInView(APIView):
     permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth_google'
 
     def post(self, request):
         serializer = GoogleSignInSerializer(data=request.data)
@@ -52,6 +77,64 @@ class MeView(generics.RetrieveUpdateAPIView):
 
 class EmailTokenObtainPairView(TokenObtainPairView):
     serializer_class = EmailTokenObtainPairSerializer
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth_login'
+
+
+class LogoutView(APIView):
+    permission_classes = [permissions.AllowAny]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth_login'
+
+    def post(self, request):
+        refresh_token = request.data.get('refresh') if isinstance(request.data, dict) else None
+        if not refresh_token:
+            return Response(
+                {'detail': 'Refresh token required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            token = RefreshToken(refresh_token)
+            token.blacklist()
+        except TokenError:
+            return Response(status=status.HTTP_205_RESET_CONTENT)
+        return Response(status=status.HTTP_205_RESET_CONTENT)
+
+
+class EmailVerifyRequestView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'email_verify_request'
+
+    def post(self, request):
+        if request.user.email_verified:
+            return Response({'detail': 'Email already verified.'}, status=status.HTTP_400_BAD_REQUEST)
+        code = f'{secrets.randbelow(1_000_000):06d}'
+        cache.set(_email_code_cache_key(request.user.id), _hash_code(code), EMAIL_CODE_TTL_SECONDS)
+        if settings.DEBUG:
+            logger.info('Email verify code for user %s: %s', request.user.id, code)
+        else:
+            logger.info('Email verify code issued for user %s', request.user.id)
+        return Response({'sent': True})
+
+
+class EmailVerifyConfirmView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'email_verify_confirm'
+
+    def post(self, request):
+        code = (request.data.get('code') or '').strip() if isinstance(request.data, dict) else ''
+        if not code.isdigit() or len(code) != 6:
+            return Response({'detail': 'Invalid code format.'}, status=status.HTTP_400_BAD_REQUEST)
+        key = _email_code_cache_key(request.user.id)
+        stored = cache.get(key)
+        if not stored or stored != _hash_code(code):
+            return Response({'detail': 'Invalid or expired code.'}, status=status.HTTP_400_BAD_REQUEST)
+        cache.delete(key)
+        request.user.email_verified = True
+        request.user.save(update_fields=['email_verified'])
+        return Response(UserSerializer(request.user).data)
 
 
 class LinkYouTubeView(APIView):

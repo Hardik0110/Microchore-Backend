@@ -5,8 +5,10 @@ from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from reviews.permissions import IsReviewer
+from reviews.permissions import IsReviewer, user_is_reviewer
 from projects.models import Task
+
+REVIEWER_BLOCK_MSG = 'Reviewer accounts cannot claim or submit tasks.'
 
 from .models import Claim, Submission
 from .serializers import (
@@ -34,6 +36,8 @@ class MySubmissionListCreateView(generics.ListCreateAPIView):
         return SubmissionSerializer
 
     def create(self, request, *args, **kwargs):
+        if user_is_reviewer(request.user):
+            return Response({'detail': REVIEWER_BLOCK_MSG}, status=status.HTTP_403_FORBIDDEN)
         serializer = SubmissionCreateSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         submission = serializer.save()
@@ -42,24 +46,23 @@ class MySubmissionListCreateView(generics.ListCreateAPIView):
 
 
 class SubmissionReviewView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, IsReviewer]
 
     def post(self, request, pk):
         try:
             submission = (
                 Submission.objects
-                .select_related('claim', 'claim__task', 'claim__task__project')
+                .select_related('claim', 'claim__task', 'claim__task__project', 'claim__user')
                 .get(pk=pk)
             )
         except Submission.DoesNotExist:
             return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        if not submission.claim.task.project.is_starter:
-            if not IsReviewer().has_permission(request, self):
-                return Response(
-                    {'detail': 'Reviewer access required for non-starter submissions.'},
-                    status=status.HTTP_403_FORBIDDEN,
-                )
+        if submission.claim.user_id == request.user.id:
+            return Response(
+                {'detail': 'You cannot review your own submission.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         serializer = SubmissionReviewSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -72,6 +75,8 @@ class TaskClaimView(APIView):
 
     @transaction.atomic
     def post(self, request, pk):
+        if user_is_reviewer(request.user):
+            return Response({'detail': REVIEWER_BLOCK_MSG}, status=status.HTTP_403_FORBIDDEN)
         try:
             task = Task.objects.select_for_update().get(pk=pk)
         except Task.DoesNotExist:

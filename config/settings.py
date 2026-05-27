@@ -1,7 +1,9 @@
 import os
 from pathlib import Path
 from datetime import timedelta
+from urllib.parse import urlparse
 from dotenv import load_dotenv
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -11,6 +13,12 @@ SECRET_KEY = os.environ['SECRET_KEY']
 DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
 
 ALLOWED_HOSTS = [host.strip() for host in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',') if host.strip()]
+
+if not DEBUG:
+    if not SECRET_KEY or SECRET_KEY in ('changeme', 'django-insecure') or len(SECRET_KEY) < 32:
+        raise ImproperlyConfigured('SECRET_KEY must be a strong random value (>=32 chars) in production.')
+    if '*' in ALLOWED_HOSTS:
+        raise ImproperlyConfigured('ALLOWED_HOSTS must not contain "*" in production.')
 
 FRONTEND_BASE_URL = os.getenv('FRONTEND_BASE_URL', 'http://localhost:5173').rstrip('/')
 BACKEND_BASE_URL = os.getenv('BACKEND_BASE_URL', 'http://127.0.0.1:8000').rstrip('/')
@@ -74,12 +82,34 @@ TEMPLATES = [
 WSGI_APPLICATION = 'config.wsgi.application'
 ASGI_APPLICATION = 'config.asgi.application'
 
-DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+def _build_db_config():
+    db_url = os.getenv('DATABASE_URL', '').strip()
+    if not db_url:
+        if not DEBUG:
+            raise ImproperlyConfigured(
+                'DATABASE_URL is required in production. SQLite cannot safely serve concurrent writers.'
+            )
+        return {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    parsed = urlparse(db_url)
+    if parsed.scheme not in ('postgres', 'postgresql', 'postgresql+psycopg', 'postgresql+psycopg2'):
+        raise ImproperlyConfigured(f'Unsupported DATABASE_URL scheme: {parsed.scheme!r}.')
+    return {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': (parsed.path or '').lstrip('/'),
+        'USER': parsed.username or '',
+        'PASSWORD': parsed.password or '',
+        'HOST': parsed.hostname or '',
+        'PORT': str(parsed.port) if parsed.port else '',
+        'CONN_MAX_AGE': int(os.getenv('CONN_MAX_AGE', '60')),
+        'CONN_HEALTH_CHECKS': True,
+        'OPTIONS': {'sslmode': os.getenv('DB_SSLMODE', 'require')},
     }
-}
+
+
+DATABASES = {'default': _build_db_config()}
 
 AUTH_USER_MODEL = 'accounts.User'
 
@@ -103,6 +133,9 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 CORS_ALLOW_ALL_ORIGINS = os.getenv('CORS_ALLOW_ALL_ORIGINS', 'False').lower() == 'true'
 CORS_ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv('CORS_ALLOWED_ORIGINS', 'http://localhost:5173,http://127.0.0.1:5173').split(',') if origin.strip()]
 
+if not DEBUG and CORS_ALLOW_ALL_ORIGINS:
+    raise ImproperlyConfigured('CORS_ALLOW_ALL_ORIGINS must be False in production.')
+
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
@@ -110,6 +143,19 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
+    'DEFAULT_THROTTLE_CLASSES': (
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ),
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': os.getenv('THROTTLE_ANON', '60/min'),
+        'user': os.getenv('THROTTLE_USER', '600/min'),
+        'auth_signup': os.getenv('THROTTLE_AUTH_SIGNUP', '5/min'),
+        'auth_login': os.getenv('THROTTLE_AUTH_LOGIN', '10/min'),
+        'auth_google': os.getenv('THROTTLE_AUTH_GOOGLE', '10/min'),
+        'email_verify_request': os.getenv('THROTTLE_EMAIL_VERIFY_REQUEST', '5/min'),
+        'email_verify_confirm': os.getenv('THROTTLE_EMAIL_VERIFY_CONFIRM', '20/min'),
+    },
 }
 
 GOOGLE_OAUTH_CLIENT_ID = os.getenv('GOOGLE_OAUTH_CLIENT_ID', '')
@@ -125,8 +171,32 @@ SIMPLE_JWT = {
     'AUTH_HEADER_TYPES': ('Bearer',),
 }
 
-CHANNEL_LAYERS = {
-    'default': {
-        'BACKEND': 'channels.layers.InMemoryChannelLayer',
-    },
-}
+REDIS_URL = os.getenv('REDIS_URL', '').strip()
+
+if REDIS_URL:
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            'CONFIG': {'hosts': [REDIS_URL]},
+        },
+    }
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': REDIS_URL,
+        },
+    }
+else:
+    if not DEBUG:
+        raise ImproperlyConfigured(
+            'REDIS_URL is required in production. InMemoryChannelLayer cannot serve multi-worker deployments.'
+        )
+    CHANNEL_LAYERS = {
+        'default': {'BACKEND': 'channels.layers.InMemoryChannelLayer'},
+    }
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'microchore-default',
+        },
+    }

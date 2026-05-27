@@ -1,9 +1,11 @@
+import logging
 from decimal import Decimal
 
 from rest_framework import status, permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
-from django.db import transaction
+from django.db import IntegrityError, transaction
+from django.db.models import Count, F, Subquery
 from django.utils import timezone
 
 from .permissions import IsReviewer
@@ -16,6 +18,7 @@ from earnings.models import Earning
 from accounts.models import User
 
 
+logger = logging.getLogger(__name__)
 REVIEW_PAY_PER_REVIEW = Decimal('0.05')
 
 
@@ -44,15 +47,22 @@ class ReviewCreateView(APIView):
         serializer.is_valid(raise_exception=True)
         review = serializer.save(submission=submission, reviewer=request.user)
 
-        stats, _ = ReviewerStats.objects.get_or_create(user=request.user)
+        stats, _ = ReviewerStats.objects.select_for_update().get_or_create(user=request.user)
         today = timezone.now().date()
-        if stats.last_review_at and stats.last_review_at.date() == today:
-            stats.daily_review_count += 1
+        is_same_day = bool(stats.last_review_at and stats.last_review_at.date() == today)
+        now = timezone.now()
+        if is_same_day:
+            ReviewerStats.objects.filter(pk=stats.pk).update(
+                daily_review_count=F('daily_review_count') + 1,
+                reviews_completed=F('reviews_completed') + 1,
+                last_review_at=now,
+            )
         else:
-            stats.daily_review_count = 1
-        stats.reviews_completed += 1
-        stats.last_review_at = timezone.now()
-        stats.save(update_fields=['daily_review_count', 'reviews_completed', 'last_review_at'])
+            ReviewerStats.objects.filter(pk=stats.pk).update(
+                daily_review_count=1,
+                reviews_completed=F('reviews_completed') + 1,
+                last_review_at=now,
+            )
 
         multiplier = stats.current_pay_multiplier or Decimal('1.0')
         Earning.objects.create(
@@ -79,7 +89,8 @@ class ReviewCreateView(APIView):
             ai_flags = sum(1 for r in reviews if r.feels_ai_flag)
 
             project = submission.claim.task.project
-            user = submission.claim.user
+            worker_id = submission.claim.user_id
+            mean_decimal = Decimal(str(round(mean, 2)))
 
             if stdev <= 1.0 and ai_flags < 2:
                 is_approved = mean >= 3.0
@@ -91,41 +102,61 @@ class ReviewCreateView(APIView):
                 median_review.save(update_fields=['is_authoritative'])
 
                 submission.justification = median_review.justification_text
-                submission.rating_final = mean
+                submission.rating_final = mean_decimal
                 submission.reviewed_at = timezone.now()
 
-                base_payout = project.pay_rate_per_approved_task if is_approved and not project.is_starter else 0
+                base_payout = (
+                    project.pay_rate_per_approved_task
+                    if is_approved and not project.is_starter
+                    else Decimal('0.0000')
+                )
                 submission.base_payout = base_payout
-                submission.save()
+                submission.save(update_fields=[
+                    'status', 'justification', 'rating_final',
+                    'reviewed_at', 'base_payout',
+                ])
 
-                if is_approved and base_payout > 0:
-                    Earning.objects.create(
-                        user=user,
-                        project=project,
-                        submission=submission,
-                        amount=base_payout,
-                        kind='BASE',
-                        status='PENDING_PAYOUT'
-                    )
+                if is_approved and base_payout > Decimal('0'):
+                    try:
+                        Earning.objects.create(
+                            user_id=worker_id,
+                            project=project,
+                            submission=submission,
+                            amount=base_payout,
+                            kind='BASE',
+                            status='PENDING_PAYOUT',
+                        )
+                    except IntegrityError:
+                        logger.warning(
+                            'Duplicate BASE earning suppressed for submission=%s worker=%s',
+                            submission.pk, worker_id,
+                        )
 
                 if project.is_starter:
-                    if is_approved:
-                        user.starter_approved += 1
-                    else:
-                        user.starter_rejected += 1
-                    user.save(update_fields=['starter_approved', 'starter_rejected'])
+                    field = 'starter_approved' if is_approved else 'starter_rejected'
+                    User.objects.filter(pk=worker_id).update(**{field: F(field) + 1})
 
             else:
                 submission.status = 'HELD'
                 submission.save(update_fields=['status'])
 
-                admin_user = User.objects.filter(reviewer_stats__tier='ADMIN', is_active=True).first()
+                admin_user = (
+                    User.objects
+                    .filter(reviewer_stats__tier='ADMIN', is_active=True)
+                    .first()
+                )
                 if admin_user:
                     bundle, _ = Bundle.objects.get_or_create(
                         reviewer=admin_user,
-                        status='OPEN'
+                        status='OPEN',
                     )
                     bundle.submissions.add(submission)
+                else:
+                    logger.error(
+                        'Submission %s escalated to HELD but no ADMIN reviewer exists. '
+                        'Manual intervention required.',
+                        submission.pk,
+                    )
 
         return Response(SubmissionSerializer(submission).data, status=status.HTTP_201_CREATED)
 
@@ -148,7 +179,7 @@ def _serialize_for_queue(submission):
         'pastedChars': submission.pasted_chars,
         'charsTyped': submission.keypress_count,
         'submittedAt': submission.submitted_at.isoformat(),
-        'reviewCount': submission.reviews.count(),
+        'reviewCount': getattr(submission, 'review_count', submission.reviews.count()),
     }
 
 
@@ -162,18 +193,80 @@ class ReviewerQueueView(APIView):
             limit = 20
         limit = max(1, min(limit, 50))
 
-        already_reviewed_ids = Review.objects.filter(
-            reviewer=request.user
-        ).values_list('submission_id', flat=True)
+        already_reviewed = Review.objects.filter(reviewer=request.user).values('submission_id')
 
         candidates = (
             Submission.objects
             .filter(status__in=['PENDING', 'IN_REVIEW'])
             .filter(claim__task__project__is_starter=False)
             .exclude(claim__user=request.user)
-            .exclude(pk__in=already_reviewed_ids)
+            .exclude(pk__in=Subquery(already_reviewed))
             .select_related('claim', 'claim__task', 'claim__task__project')
+            .annotate(review_count=Count('reviews'))
             .order_by('submitted_at')[:limit]
         )
 
         return Response([_serialize_for_queue(s) for s in candidates])
+
+
+class ReviewerStatsView(APIView):
+    permission_classes = [permissions.IsAuthenticated, IsReviewer]
+
+    def get(self, request):
+        from django.db.models import Sum
+        from earnings.models import Earning
+        from datetime import timedelta
+
+        stats = ReviewerStats.objects.filter(user=request.user).first()
+        queue_size = (
+            Submission.objects
+            .filter(status__in=['PENDING', 'IN_REVIEW'])
+            .filter(claim__task__project__is_starter=False)
+            .exclude(claim__user=request.user)
+            .exclude(pk__in=Subquery(Review.objects.filter(reviewer=request.user).values('submission_id')))
+            .count()
+        )
+
+        earnings_qs = Earning.objects.filter(user=request.user, kind='REVIEW_PAY')
+        totals = earnings_qs.aggregate(
+            total_paid=Sum('amount', filter=models_q_status('PAID')),
+            total_pending=Sum('amount', filter=models_q_status('PENDING_PAYOUT')),
+        )
+
+        seven_days_ago = timezone.now() - timedelta(days=7)
+        recent_reviews = Review.objects.filter(reviewer=request.user, created_at__gte=seven_days_ago).count()
+
+        recent_earnings = list(
+            earnings_qs
+            .select_related('submission', 'project')
+            .order_by('-created_at')[:20]
+        )
+
+        return Response({
+            'tier': stats.tier if stats else 'T1',
+            'multiplier': float(stats.current_pay_multiplier) if stats and stats.current_pay_multiplier is not None else 1.0,
+            'reviewsCompleted': stats.reviews_completed if stats else 0,
+            'dailyReviewCount': stats.daily_review_count if stats else 0,
+            'rollingAccuracyScore': float(stats.rolling_accuracy_score) if stats and stats.rolling_accuracy_score is not None else None,
+            'lastReviewAt': stats.last_review_at.isoformat() if stats and stats.last_review_at else None,
+            'queueSize': queue_size,
+            'recentReviewsLast7Days': recent_reviews,
+            'totalPaid': float(totals['total_paid'] or 0),
+            'totalPending': float(totals['total_pending'] or 0),
+            'recentEarnings': [
+                {
+                    'id': e.id,
+                    'amount': float(e.amount),
+                    'status': e.status,
+                    'projectName': e.project.name if e.project_id else None,
+                    'createdAt': e.created_at.isoformat() if e.created_at else None,
+                    'paidAt': e.paid_at.isoformat() if e.paid_at else None,
+                }
+                for e in recent_earnings
+            ],
+        })
+
+
+def models_q_status(status_value):
+    from django.db.models import Q
+    return Q(status=status_value)

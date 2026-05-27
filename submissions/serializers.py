@@ -1,12 +1,23 @@
+import logging
 from datetime import timedelta
+from decimal import Decimal
 
 from django.db import transaction
+from django.db.models import F
 from django.utils import timezone
 from rest_framework import serializers
 
+from ai_detection.service import (
+    AIDetectionUnavailable,
+    evaluate_for_project,
+    is_configured as ai_detection_is_configured,
+)
 from projects.models import Task
 
 from .models import Claim, Submission
+
+
+logger = logging.getLogger(__name__)
 
 
 STATUS_TO_FRONTEND = {
@@ -95,16 +106,14 @@ class SubmissionCreateSerializer(serializers.Serializer):
     elapsedSec = serializers.IntegerField(default=0)
     attestationSigned = serializers.BooleanField(default=False)
 
-    def validate_taskId(self, value):
-        if not Task.objects.filter(pk=value).exists():
-            raise serializers.ValidationError('Task does not exist')
-        return value
-
     @transaction.atomic
     def create(self, validated_data):
         request = self.context['request']
         user = request.user
-        task = Task.objects.select_for_update().get(pk=validated_data['taskId'])
+        try:
+            task = Task.objects.select_for_update().select_related('project').get(pk=validated_data['taskId'])
+        except Task.DoesNotExist:
+            raise serializers.ValidationError({'taskId': 'Task does not exist'})
 
         if Submission.objects.filter(claim__user=user, claim__task=task).exists():
             raise serializers.ValidationError({
@@ -112,24 +121,56 @@ class SubmissionCreateSerializer(serializers.Serializer):
             })
 
         if task.project.is_starter:
-            claim, _ = Claim.objects.get_or_create(
+            if task.status != 'OPEN' or task.remaining_count <= 0:
+                raise serializers.ValidationError({'taskId': 'Task is no longer available.'})
+            claim, created = Claim.objects.get_or_create(
                 task=task,
                 user=user,
                 status='ACTIVE',
                 defaults={'expires_at': timezone.now() + timedelta(hours=24)},
             )
+            if created:
+                task.remaining_count = F('remaining_count') - 1
+                task.save(update_fields=['remaining_count'])
+                task.refresh_from_db(fields=['remaining_count'])
+                if task.remaining_count <= 0:
+                    Task.objects.filter(pk=task.pk).update(status='EXHAUSTED')
         else:
             claim = Claim.objects.filter(task=task, user=user, status='ACTIVE').first()
             if not claim:
                 raise serializers.ValidationError({'taskId': 'You must claim this task before making a submission.'})
+            if claim.expires_at <= timezone.now():
+                claim.status = 'EXPIRED'
+                claim.save(update_fields=['status'])
+                raise serializers.ValidationError({'taskId': 'Your claim on this task has expired.'})
 
         claim.status = 'SUBMITTED'
         claim.save(update_fields=['status'])
 
+        ai_score = Decimal('0.0')
+        initial_status = 'PENDING'
+        text = validated_data['text']
+        project = task.project
+        if ai_detection_is_configured():
+            try:
+                result = evaluate_for_project(text, project.ai_detection_strictness)
+                if result is not None:
+                    ai_score = result.score
+                    if result.flagged:
+                        initial_status = 'HELD'
+            except AIDetectionUnavailable as exc:
+                logger.error(
+                    'AI detection unavailable for submission by user=%s on task=%s: %s',
+                    user.id, task.id, exc,
+                )
+                initial_status = 'HELD'
+        elif not project.is_starter:
+            logger.warning('AI detection not configured; submitting without score.')
+
         submission = Submission.objects.create(
             claim=claim,
             comment_url=validated_data['commentUrl'],
-            comment_text_snapshot=validated_data['text'],
+            comment_text_snapshot=text,
             comment_account_handle=(user.handle or user.email.split('@')[0])[:100],
             proof_type='URL',
             paste_event_count=validated_data['pasteCount'],
@@ -137,7 +178,8 @@ class SubmissionCreateSerializer(serializers.Serializer):
             keypress_count=validated_data['charsTyped'],
             time_to_compose_seconds=validated_data['elapsedSec'],
             attestation_signed=validated_data['attestationSigned'],
-            status='PENDING',
+            ai_likelihood_score=ai_score,
+            status=initial_status,
         )
         return submission
 
@@ -154,6 +196,7 @@ class SubmissionReviewSerializer(serializers.Serializer):
 
     @transaction.atomic
     def apply(self, submission: Submission) -> Submission:
+        from accounts.models import User
         decision = self.validated_data['decision']
         is_approved = decision == 'approved'
         project = submission.claim.task.project
@@ -164,12 +207,12 @@ class SubmissionReviewSerializer(serializers.Serializer):
         submission.reviewed_at = timezone.now()
         submission.base_payout = base
         submission.bonus_payout = 0
-        submission.save()
+        submission.save(update_fields=[
+            'status', 'rating_final', 'justification',
+            'reviewed_at', 'base_payout', 'bonus_payout',
+        ])
         if project.is_starter:
-            worker = submission.claim.user
-            if is_approved:
-                worker.starter_approved = (worker.starter_approved or 0) + 1
-            else:
-                worker.starter_rejected = (worker.starter_rejected or 0) + 1
-            worker.save(update_fields=['starter_approved', 'starter_rejected'])
+            worker_id = submission.claim.user_id
+            field = 'starter_approved' if is_approved else 'starter_rejected'
+            User.objects.filter(pk=worker_id).update(**{field: F(field) + 1})
         return submission

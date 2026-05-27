@@ -6,6 +6,8 @@ from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from reviews.permissions import user_is_reviewer
+
 from .models import SocialAccount
 
 User = get_user_model()
@@ -45,19 +47,21 @@ class UserSerializer(serializers.ModelSerializer):
     attestedAt = serializers.DateTimeField(source='attested_at', allow_null=True, required=False)
     tutorialCompletedAt = serializers.DateTimeField(source='tutorial_completed_at', allow_null=True, required=False)
     linkedAccount = serializers.SerializerMethodField()
+    isReviewer = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = [
-            'id', 'email', 'handle', 'country', 'createdAt',
+            'id', 'email', 'handle', 'country', 'role', 'createdAt',
             'emailVerified', 'wizardStep',
             'starterApproved', 'starterRejected', 'realTasksUnlocked',
             'holdReason', 'payoutMethod', 'payoutHandle',
-            'attestedAt', 'tutorialCompletedAt', 'linkedAccount',
+            'attestedAt', 'tutorialCompletedAt', 'linkedAccount', 'isReviewer',
         ]
         read_only_fields = [
-            'id', 'email', 'createdAt', 'realTasksUnlocked',
+            'id', 'email', 'role', 'createdAt', 'realTasksUnlocked',
             'emailVerified', 'wizardStep', 'starterApproved', 'starterRejected',
+            'isReviewer',
         ]
 
     def get_holdReason(self, obj):
@@ -76,6 +80,9 @@ class UserSerializer(serializers.ModelSerializer):
         if not acct:
             return None
         return LinkedAccountSerializer(acct).data
+
+    def get_isReviewer(self, obj):
+        return user_is_reviewer(obj)
 
 
 class SignupSerializer(serializers.ModelSerializer):

@@ -48,5 +48,14 @@ class Earning(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     paid_at = models.DateTimeField(null=True, blank=True)
 
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['submission', 'kind'],
+                condition=models.Q(submission__isnull=False) & models.Q(kind__in=['BASE', 'BONUS']),
+                name='earning_unique_payout_per_submission_kind',
+            ),
+        ]
+
     def __str__(self):
         return f"Earning of {self.amount} for {self.user.email} (Kind: {self.kind})"
