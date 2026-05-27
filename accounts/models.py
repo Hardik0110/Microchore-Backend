@@ -111,3 +111,33 @@ class Strike(models.Model):
 
     def __str__(self):
         return f"Strike {self.kind} on {self.user}"
+
+
+class Notification(models.Model):
+    KIND_CHOICES = (
+        ('submission_approved', 'Submission Approved'),
+        ('submission_rejected', 'Submission Rejected'),
+        ('real_tasks_unlocked', 'Real Tasks Unlocked'),
+        ('promoted_to_reviewer', 'Promoted To Reviewer'),
+        ('account_held', 'Account On Hold'),
+        ('system', 'System Notice'),
+    )
+
+    recipient = models.ForeignKey(User, on_delete=models.CASCADE, related_name='notifications')
+    kind = models.CharField(max_length=30, choices=KIND_CHOICES)
+    title = models.CharField(max_length=120)
+    body = models.CharField(max_length=400, blank=True, default='')
+    link = models.CharField(max_length=255, blank=True, default='')
+    is_read = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    read_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['recipient', '-created_at']),
+            models.Index(fields=['recipient', 'is_read']),
+        ]
+
+    def __str__(self):
+        return f"Notification {self.kind} -> {self.recipient.email} ({'read' if self.is_read else 'unread'})"

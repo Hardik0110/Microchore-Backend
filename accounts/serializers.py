@@ -8,7 +8,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from reviews.permissions import user_is_reviewer
 
-from .models import SocialAccount
+from .models import Notification, SocialAccount
 
 User = get_user_model()
 
@@ -42,7 +42,7 @@ class UserSerializer(serializers.ModelSerializer):
     starterRejected = serializers.IntegerField(source='starter_rejected')
     realTasksUnlocked = serializers.BooleanField(source='real_tasks_unlocked', read_only=True)
     holdReason = serializers.SerializerMethodField()
-    payoutMethod = serializers.SerializerMethodField()
+    payoutMethod = serializers.CharField(allow_null=True, required=False)
     payoutHandle = serializers.CharField(source='payout_handle', allow_null=True, required=False)
     attestedAt = serializers.DateTimeField(source='attested_at', allow_null=True, required=False)
     tutorialCompletedAt = serializers.DateTimeField(source='tutorial_completed_at', allow_null=True, required=False)
@@ -70,10 +70,23 @@ class UserSerializer(serializers.ModelSerializer):
         last_hold = obj.holds.order_by('-started_at').first()
         return last_hold.reason if last_hold else 'Account on hold'
 
-    def get_payoutMethod(self, obj):
-        if not obj.payout_method:
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data['payoutMethod'] = instance.payout_method.lower() if instance.payout_method else None
+        return data
+
+    def validate_payoutMethod(self, value):
+        if value in (None, ''):
             return None
-        return obj.payout_method.lower()
+        normalized = value.strip().upper()
+        if normalized not in {'AIRTM', 'PAYPAL', 'CRYPTO'}:
+            raise serializers.ValidationError('Must be one of: airtm, paypal, crypto.')
+        return normalized
+
+    def update(self, instance, validated_data):
+        if 'payoutMethod' in validated_data:
+            instance.payout_method = validated_data.pop('payoutMethod')
+        return super().update(instance, validated_data)
 
     def get_linkedAccount(self, obj):
         acct = obj.social_accounts.filter(is_active=True).order_by('-last_snapshot_at').first()
@@ -111,7 +124,8 @@ class SignupSerializer(serializers.ModelSerializer):
             password=validated['password'],
             handle=validated.get('handle', ''),
             country=validated.get('country', ''),
-            wizard_step='verify-email',
+            email_verified=True,
+            wizard_step='welcome',
         )
         return user
 
@@ -316,3 +330,14 @@ class GoogleSignInSerializer(serializers.Serializer):
             'refresh': str(refresh),
             'user': UserSerializer(user).data,
         }
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    isRead = serializers.BooleanField(source='is_read', read_only=True)
+    createdAt = serializers.DateTimeField(source='created_at', read_only=True)
+    readAt = serializers.DateTimeField(source='read_at', read_only=True)
+
+    class Meta:
+        model = Notification
+        fields = ['id', 'kind', 'title', 'body', 'link', 'isRead', 'createdAt', 'readAt']
+        read_only_fields = fields

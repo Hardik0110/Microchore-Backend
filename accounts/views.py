@@ -18,11 +18,12 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from . import twitter_oauth
-from .models import SocialAccount
+from .models import Notification, SocialAccount
 from .serializers import (
     EmailTokenObtainPairSerializer,
     GoogleSignInSerializer,
     LinkYouTubeSerializer,
+    NotificationSerializer,
     SignupSerializer,
     UserSerializer,
     issue_tokens_for,
@@ -242,3 +243,46 @@ class TwitterCallbackView(APIView):
         )
 
         return self._redirect_with('linked')
+
+
+class NotificationListView(generics.ListAPIView):
+    serializer_class = NotificationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = Notification.objects.filter(recipient=self.request.user).order_by('-created_at')
+        unread_only = self.request.query_params.get('unread')
+        if unread_only in ('1', 'true', 'yes'):
+            qs = qs.filter(is_read=False)
+        return qs[:50]
+
+    def list(self, request, *args, **kwargs):
+        qs = self.get_queryset()
+        serializer = self.get_serializer(qs, many=True)
+        unread_count = Notification.objects.filter(recipient=request.user, is_read=False).count()
+        return Response({'results': serializer.data, 'unreadCount': unread_count})
+
+
+class NotificationMarkReadView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request, pk: int):
+        try:
+            notif = Notification.objects.get(pk=pk, recipient=request.user)
+        except Notification.DoesNotExist:
+            return Response({'detail': 'Not found.'}, status=status.HTTP_404_NOT_FOUND)
+        if not notif.is_read:
+            notif.is_read = True
+            notif.read_at = timezone.now()
+            notif.save(update_fields=['is_read', 'read_at'])
+        return Response(NotificationSerializer(notif).data)
+
+
+class NotificationMarkAllReadView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        updated = Notification.objects.filter(
+            recipient=request.user, is_read=False,
+        ).update(is_read=True, read_at=timezone.now())
+        return Response({'updated': updated})

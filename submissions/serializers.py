@@ -197,6 +197,11 @@ class SubmissionReviewSerializer(serializers.Serializer):
     @transaction.atomic
     def apply(self, submission: Submission) -> Submission:
         from accounts.models import User
+        from accounts.notifications import (
+            notify_real_tasks_unlocked,
+            notify_submission_approved,
+            notify_submission_rejected,
+        )
         decision = self.validated_data['decision']
         is_approved = decision == 'approved'
         project = submission.claim.task.project
@@ -211,8 +216,22 @@ class SubmissionReviewSerializer(serializers.Serializer):
             'status', 'rating_final', 'justification',
             'reviewed_at', 'base_payout', 'bonus_payout',
         ])
+
+        worker = submission.claim.user
+        unlocked_just_now = False
         if project.is_starter:
             worker_id = submission.claim.user_id
             field = 'starter_approved' if is_approved else 'starter_rejected'
             User.objects.filter(pk=worker_id).update(**{field: F(field) + 1})
+            worker.refresh_from_db(fields=['starter_approved', 'status'])
+            unlocked_just_now = is_approved and worker.real_tasks_unlocked
+
+        if is_approved:
+            notify_submission_approved(submission)
+        else:
+            notify_submission_rejected(submission, self.validated_data.get('justification') or '')
+
+        if unlocked_just_now and not worker.notifications.filter(kind='real_tasks_unlocked').exists():
+            notify_real_tasks_unlocked(worker)
+
         return submission
