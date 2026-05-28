@@ -1,4 +1,3 @@
-"""Twitter OAuth 2.0 (PKCE) helpers for the account-link flow."""
 import base64
 import hashlib
 import os

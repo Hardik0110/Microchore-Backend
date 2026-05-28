@@ -16,8 +16,6 @@ def user_is_reviewer(user) -> bool:
 
 
 class IsReviewer(permissions.BasePermission):
-    """Allow access only to users with a ReviewerStats row in an active tier, or staff."""
-
     message = 'Reviewer access required.'
 
     def has_permission(self, request, view):

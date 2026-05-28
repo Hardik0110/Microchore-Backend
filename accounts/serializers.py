@@ -161,7 +161,6 @@ def issue_tokens_for(user):
 
 
 class LinkYouTubeSerializer(serializers.Serializer):
-    """Exchanges a YouTube OAuth access token for a verified SocialAccount link."""
     access_token = serializers.CharField(write_only=True)
 
     def validate(self, attrs):
