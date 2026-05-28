@@ -124,8 +124,7 @@ class SignupSerializer(serializers.ModelSerializer):
             password=validated['password'],
             handle=validated.get('handle', ''),
             country=validated.get('country', ''),
-            email_verified=True,
-            wizard_step='welcome',
+            wizard_step='verify-email',
         )
         return user
 
