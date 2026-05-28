@@ -47,6 +47,7 @@ class UserSerializer(serializers.ModelSerializer):
     attestedAt = serializers.DateTimeField(source='attested_at', allow_null=True, required=False)
     tutorialCompletedAt = serializers.DateTimeField(source='tutorial_completed_at', allow_null=True, required=False)
     linkedAccount = serializers.SerializerMethodField()
+    linkedAccounts = serializers.SerializerMethodField()
     isReviewer = serializers.SerializerMethodField()
 
     class Meta:
@@ -56,7 +57,7 @@ class UserSerializer(serializers.ModelSerializer):
             'emailVerified', 'wizardStep',
             'starterApproved', 'starterRejected', 'realTasksUnlocked',
             'holdReason', 'payoutMethod', 'payoutHandle',
-            'attestedAt', 'tutorialCompletedAt', 'linkedAccount', 'isReviewer',
+            'attestedAt', 'tutorialCompletedAt', 'linkedAccount', 'linkedAccounts', 'isReviewer',
         ]
         read_only_fields = [
             'id', 'email', 'role', 'createdAt', 'realTasksUnlocked',
@@ -93,6 +94,10 @@ class UserSerializer(serializers.ModelSerializer):
         if not acct:
             return None
         return LinkedAccountSerializer(acct).data
+
+    def get_linkedAccounts(self, obj):
+        qs = obj.social_accounts.filter(is_active=True).order_by('-last_snapshot_at')
+        return LinkedAccountSerializer(qs, many=True).data
 
     def get_isReviewer(self, obj):
         return user_is_reviewer(obj)
