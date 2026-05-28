@@ -7,6 +7,7 @@ from urllib.parse import quote
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
+from django.core.mail import send_mail
 from django.shortcuts import redirect
 from django.utils import timezone
 from rest_framework import generics, permissions, status
@@ -112,10 +113,30 @@ class EmailVerifyRequestView(APIView):
             return Response({'detail': 'Email already verified.'}, status=status.HTTP_400_BAD_REQUEST)
         code = f'{secrets.randbelow(1_000_000):06d}'
         cache.set(_email_code_cache_key(request.user.id), _hash_code(code), EMAIL_CODE_TTL_SECONDS)
-        if settings.DEBUG:
-            logger.info('Email verify code for user %s: %s', request.user.id, code)
-        else:
-            logger.info('Email verify code issued for user %s', request.user.id)
+        subject = 'Your Microchore verification code'
+        body = (
+            f'Hi,\n\n'
+            f'Your Microchore verification code is: {code}\n\n'
+            f'It expires in {EMAIL_CODE_TTL_SECONDS // 60} minutes. If you did not request this, you can ignore this email.\n\n'
+            f'- Microchore'
+        )
+        try:
+            send_mail(
+                subject=subject,
+                message=body,
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[request.user.email],
+                fail_silently=False,
+            )
+        except Exception as exc:
+            logger.exception('Failed to send verification email to user %s', request.user.id)
+            if settings.DEBUG:
+                logger.info('Email verify code for user %s (mail failed): %s', request.user.id, code)
+            return Response(
+                {'detail': 'Could not send verification email. Try again in a moment.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        logger.info('Email verify code sent to user %s', request.user.id)
         return Response({'sent': True})
 
 
