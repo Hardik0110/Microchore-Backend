@@ -1,5 +1,8 @@
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.auth.password_validation import validate_password as django_validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import IntegrityError, transaction
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
 from rest_framework import serializers
@@ -84,6 +87,44 @@ class UserSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('Must be one of: airtm, paypal, crypto.')
         return normalized
 
+    def validate_country(self, value):
+        if value in (None, ''):
+            return ''
+        normalized = value.strip().upper()
+        if len(normalized) != 2 or not normalized.isalpha():
+            raise serializers.ValidationError('Country must be a 2-letter ISO-3166 alpha-2 code.')
+        return normalized
+
+    def validate(self, attrs):
+        instance = self.instance
+        payout_method = attrs.get('payoutMethod', getattr(instance, 'payout_method', None) if instance else None)
+        payout_handle = attrs.get('payout_handle', getattr(instance, 'payout_handle', None) if instance else None)
+        if payout_handle is not None and payout_handle != '':
+            handle = payout_handle.strip()
+            if not handle:
+                raise serializers.ValidationError({'payoutHandle': 'Must not be blank.'})
+            method = (payout_method or '').upper()
+            if method == 'PAYPAL':
+                if '@' not in handle or '.' not in handle.split('@')[-1]:
+                    raise serializers.ValidationError({'payoutHandle': 'PayPal handle must be an email address.'})
+            elif method == 'AIRTM':
+                if len(handle) < 3 or len(handle) > 64:
+                    raise serializers.ValidationError({'payoutHandle': 'Invalid Airtm handle.'})
+            elif method == 'CRYPTO':
+                if len(handle) < 8 or len(handle) > 128:
+                    raise serializers.ValidationError({'payoutHandle': 'Invalid crypto address.'})
+            elif method == '':
+                raise serializers.ValidationError({'payoutMethod': 'Required when setting a payout handle.'})
+            if instance and not getattr(instance, 'email_verified', False):
+                raise serializers.ValidationError({'detail': 'Verify your email before setting payout details.'})
+            attrs['payout_handle'] = handle
+            qs = User.objects.filter(payout_handle__iexact=handle)
+            if instance:
+                qs = qs.exclude(pk=instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError({'payoutHandle': 'Payout handle already in use.'})
+        return attrs
+
     def update(self, instance, validated_data):
         if 'payoutMethod' in validated_data:
             instance.payout_method = validated_data.pop('payoutMethod')
@@ -121,16 +162,28 @@ class SignupSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError('An account with this email already exists.')
         return value
 
+    def validate(self, attrs):
+        password = attrs.get('password') or ''
+        try:
+            django_validate_password(password, user=None)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'password': list(exc.messages)})
+        return attrs
+
     def create(self, validated):
         email = validated['email']
-        user = User.objects.create_user(
-            username=email,
-            email=email,
-            password=validated['password'],
-            handle=validated.get('handle', ''),
-            country=validated.get('country', ''),
-            wizard_step='verify-email',
-        )
+        try:
+            with transaction.atomic():
+                user = User.objects.create_user(
+                    username=email,
+                    email=email,
+                    password=validated['password'],
+                    handle=validated.get('handle', ''),
+                    country=validated.get('country', ''),
+                    wizard_step='verify-email',
+                )
+        except IntegrityError:
+            raise serializers.ValidationError({'email': 'An account with this email already exists.'})
         return user
 
 
@@ -140,14 +193,21 @@ class EmailTokenObtainPairSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         email = (attrs.get('email') or '').lower().strip()
+        generic_error = {'detail': 'Invalid email or password.'}
         try:
             user = User.objects.get(email__iexact=email)
         except User.DoesNotExist:
-            raise serializers.ValidationError({'detail': 'No active account found with the given credentials.'})
+            raise serializers.ValidationError(generic_error)
+        except User.MultipleObjectsReturned:
+            user = User.objects.filter(email__iexact=email).order_by('id').first()
+            if not user:
+                raise serializers.ValidationError(generic_error)
         if not user.is_active:
-            raise serializers.ValidationError({'detail': 'Account is disabled.'})
+            raise serializers.ValidationError(generic_error)
         if not user.check_password(attrs.get('password')):
-            raise serializers.ValidationError({'detail': 'Incorrect password.'})
+            raise serializers.ValidationError(generic_error)
+        if getattr(user, 'status', None) == 'BANNED':
+            raise serializers.ValidationError({'detail': 'Account banned.'})
         refresh = RefreshToken.for_user(user)
         return {
             'access': str(refresh.access_token),
@@ -236,31 +296,42 @@ class LinkYouTubeSerializer(serializers.Serializer):
         user = request.user if request else None
         if user is None or not user.is_authenticated:
             raise serializers.ValidationError({'detail': 'Not authenticated.'})
+        if getattr(user, 'status', None) != 'ACTIVE':
+            raise serializers.ValidationError({'detail': 'Account is not active.'})
+        if not getattr(user, 'email_verified', False):
+            raise serializers.ValidationError({'detail': 'Verify your email before linking social accounts.'})
 
         stored_handle = handle.lstrip('@')[:100]
-        clash = (
-            SocialAccount.objects
-            .filter(platform='YT', handle=stored_handle)
-            .exclude(user=user)
-            .exists()
-        )
-        if clash:
+        try:
+            with transaction.atomic():
+                clash = (
+                    SocialAccount.objects
+                    .select_for_update()
+                    .filter(platform='YT', handle=stored_handle)
+                    .exclude(user=user)
+                    .exists()
+                )
+                if clash:
+                    raise serializers.ValidationError({
+                        'detail': f'This YouTube channel (@{stored_handle}) is already linked to another Microchore account.',
+                    })
+
+                social, _ = SocialAccount.objects.update_or_create(
+                    user=user,
+                    platform='YT',
+                    defaults={
+                        'handle': stored_handle,
+                        'follower_count': followers,
+                        'post_count': videos,
+                        'account_age_days': age_days,
+                        'verified_at': timezone.now(),
+                        'is_active': True,
+                    },
+                )
+        except IntegrityError:
             raise serializers.ValidationError({
                 'detail': f'This YouTube channel (@{stored_handle}) is already linked to another Microchore account.',
             })
-
-        social, _ = SocialAccount.objects.update_or_create(
-            user=user,
-            platform='YT',
-            defaults={
-                'handle': stored_handle,
-                'follower_count': followers,
-                'post_count': videos,
-                'account_age_days': age_days,
-                'verified_at': timezone.now(),
-                'is_active': True,
-            },
-        )
 
         return {
             'linkedAccount': LinkedAccountSerializer(social).data,
@@ -301,6 +372,7 @@ class GoogleSignInSerializer(serializers.Serializer):
         handle = given_name or email.split('@')[0]
 
         user = User.objects.filter(email__iexact=email).first()
+        confirm_merge = bool(self.initial_data.get('confirm_merge')) if hasattr(self, 'initial_data') else False
         if user is None:
             user = User.objects.create_user(
                 username=email,
@@ -314,9 +386,12 @@ class GoogleSignInSerializer(serializers.Serializer):
             user.set_unusable_password()
             user.save(update_fields=['password'])
         else:
+            if user.has_usable_password() and not user.email_verified and not confirm_merge:
+                raise serializers.ValidationError({
+                    'detail': 'merge_confirmation_required',
+                    'code': 'merge_confirmation_required',
+                })
             updates = {}
-            if not user.email_verified:
-                updates['email_verified'] = True
             if not user.handle:
                 updates['handle'] = handle
             if updates:
@@ -325,7 +400,9 @@ class GoogleSignInSerializer(serializers.Serializer):
                 user.save(update_fields=list(updates.keys()))
 
         if not user.is_active:
-            raise serializers.ValidationError({'detail': 'Account is disabled.'})
+            raise serializers.ValidationError({'detail': 'Invalid email or password.'})
+        if getattr(user, 'status', None) == 'BANNED':
+            raise serializers.ValidationError({'detail': 'Account banned.'})
 
         refresh = RefreshToken.for_user(user)
         return {

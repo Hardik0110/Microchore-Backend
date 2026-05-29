@@ -1,5 +1,4 @@
 from django.urls import path
-from rest_framework_simplejwt.views import TokenRefreshView
 
 from .admin_views import AdminPromoteReviewerView, AdminUserListView
 from .views import (
@@ -14,6 +13,7 @@ from .views import (
     NotificationMarkAllReadView,
     NotificationMarkReadView,
     SignupView,
+    ThrottledTokenRefreshView,
     TwitterCallbackView,
     TwitterStartView,
 )
@@ -24,7 +24,7 @@ urlpatterns = [
     path('signup/', SignupView.as_view(), name='signup'),
     path('google/', GoogleSignInView.as_view(), name='google_signin'),
     path('token/', EmailTokenObtainPairView.as_view(), name='token_obtain_pair'),
-    path('token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
+    path('token/refresh/', ThrottledTokenRefreshView.as_view(), name='token_refresh'),
     path('logout/', LogoutView.as_view(), name='logout'),
     path('me/', MeView.as_view(), name='me'),
     path('email/verify/request/', EmailVerifyRequestView.as_view(), name='email_verify_request'),

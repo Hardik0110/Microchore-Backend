@@ -90,7 +90,7 @@ class SubmissionSerializer(serializers.ModelSerializer):
     def get_rating(self, obj):
         if obj.rating_final is None:
             return None
-        return int(obj.rating_final)
+        return int(Decimal(obj.rating_final).to_integral_value(rounding='ROUND_HALF_UP'))
 
     def get_isStarter(self, obj):
         return bool(obj.claim.task.project.is_starter)
@@ -100,138 +100,154 @@ class SubmissionCreateSerializer(serializers.Serializer):
     taskId = serializers.IntegerField()
     text = serializers.CharField()
     commentUrl = serializers.URLField()
-    pasteCount = serializers.IntegerField(default=0)
-    charsTyped = serializers.IntegerField(default=0)
-    pastedChars = serializers.IntegerField(default=0)
-    elapsedSec = serializers.IntegerField(default=0)
+    pasteCount = serializers.IntegerField(default=0, min_value=0, max_value=10_000)
+    charsTyped = serializers.IntegerField(default=0, min_value=0, max_value=1_000_000)
+    pastedChars = serializers.IntegerField(default=0, min_value=0, max_value=1_000_000)
+    elapsedSec = serializers.IntegerField(default=0, min_value=0, max_value=86_400)
     attestationSigned = serializers.BooleanField(default=False)
+    socialAccountId = serializers.IntegerField(required=False, allow_null=True)
 
-    @transaction.atomic
+    def _verify_social_account(self, user, comment_url, social_account_id):
+        from accounts.models import SocialAccount
+        from urllib.parse import urlparse
+
+        def _platform_from_url(url):
+            try:
+                host = (urlparse(url).hostname or '').lower()
+            except Exception:
+                return None
+            if 'youtube.com' in host or 'youtu.be' in host:
+                return 'YT'
+            if 'instagram.com' in host:
+                return 'IG'
+            if 'tiktok.com' in host:
+                return 'TIKTOK'
+            if 'twitter.com' in host or host == 'x.com' or host.endswith('.x.com'):
+                return 'X'
+            return None
+
+        platform = _platform_from_url(comment_url)
+        if not platform:
+            return None
+        qs = SocialAccount.objects.filter(user=user, platform=platform, is_active=True, verified_at__isnull=False)
+        if social_account_id:
+            qs = qs.filter(pk=social_account_id)
+        account = qs.first()
+        if not account:
+            raise serializers.ValidationError({
+                'commentUrl': 'A verified social account matching this platform is required.',
+            })
+        return account
+
     def create(self, validated_data):
         request = self.context['request']
         user = request.user
-        try:
-            task = Task.objects.select_for_update().select_related('project').get(pk=validated_data['taskId'])
-        except Task.DoesNotExist:
-            raise serializers.ValidationError({'taskId': 'Task does not exist'})
+        text = validated_data['text']
+        comment_url = validated_data['commentUrl']
 
-        if Submission.objects.filter(claim__user=user, claim__task=task).exists():
-            raise serializers.ValidationError({
-                'taskId': 'You have already submitted on this task.',
-            })
+        with transaction.atomic():
+            try:
+                task = (
+                    Task.objects.select_for_update()
+                    .select_related('project')
+                    .get(pk=validated_data['taskId'])
+                )
+            except Task.DoesNotExist:
+                raise serializers.ValidationError({'taskId': 'Task does not exist'})
 
-        if task.project.is_starter:
-            if task.status != 'OPEN' or task.remaining_count <= 0:
-                raise serializers.ValidationError({'taskId': 'Task is no longer available.'})
-            claim, created = Claim.objects.get_or_create(
-                task=task,
-                user=user,
-                status='ACTIVE',
-                defaults={'expires_at': timezone.now() + timedelta(hours=24)},
+            project = task.project
+            if getattr(project, 'status', None) != 'ACTIVE':
+                raise serializers.ValidationError({'taskId': 'This campaign is no longer accepting submissions.'})
+            if task.expires_at and task.expires_at <= timezone.now():
+                raise serializers.ValidationError({'taskId': 'Task has expired.'})
+            if not project.is_starter and not user.real_tasks_unlocked:
+                raise serializers.ValidationError({'taskId': 'Complete the starter run before submitting real tasks.'})
+
+            if Submission.objects.filter(claim__user=user, claim__task=task).exists():
+                raise serializers.ValidationError({
+                    'taskId': 'You have already submitted on this task.',
+                })
+
+            social_account = None
+            if not project.is_starter:
+                social_account = self._verify_social_account(
+                    user, comment_url, validated_data.get('socialAccountId'),
+                )
+
+            if project.is_starter:
+                if task.status != 'OPEN' or task.remaining_count <= 0:
+                    raise serializers.ValidationError({'taskId': 'Task is no longer available.'})
+                claim, created = Claim.objects.get_or_create(
+                    task=task,
+                    user=user,
+                    status='ACTIVE',
+                    defaults={'expires_at': timezone.now() + timedelta(hours=24)},
+                )
+                if created:
+                    task.remaining_count = F('remaining_count') - 1
+                    task.save(update_fields=['remaining_count'])
+                    task.refresh_from_db(fields=['remaining_count'])
+                    if task.remaining_count <= 0:
+                        Task.objects.filter(pk=task.pk).update(status='EXHAUSTED')
+            else:
+                claim = Claim.objects.filter(task=task, user=user, status='ACTIVE').first()
+                if not claim:
+                    raise serializers.ValidationError({'taskId': 'You must claim this task before making a submission.'})
+                if claim.expires_at <= timezone.now():
+                    claim.status = 'EXPIRED'
+                    claim.save(update_fields=['status'])
+                    raise serializers.ValidationError({'taskId': 'Your claim on this task has expired.'})
+
+            claim.status = 'SUBMITTED'
+            claim.save(update_fields=['status'])
+
+            stored_handle = (
+                social_account.handle if social_account else (user.handle or (user.email.split('@')[0] if user.email else ''))
             )
-            if created:
-                task.remaining_count = F('remaining_count') - 1
-                task.save(update_fields=['remaining_count'])
-                task.refresh_from_db(fields=['remaining_count'])
-                if task.remaining_count <= 0:
-                    Task.objects.filter(pk=task.pk).update(status='EXHAUSTED')
-        else:
-            claim = Claim.objects.filter(task=task, user=user, status='ACTIVE').first()
-            if not claim:
-                raise serializers.ValidationError({'taskId': 'You must claim this task before making a submission.'})
-            if claim.expires_at <= timezone.now():
-                claim.status = 'EXPIRED'
-                claim.save(update_fields=['status'])
-                raise serializers.ValidationError({'taskId': 'Your claim on this task has expired.'})
+            stored_handle = (stored_handle or '')[:100]
 
-        claim.status = 'SUBMITTED'
-        claim.save(update_fields=['status'])
+            submission = Submission.objects.create(
+                claim=claim,
+                comment_url=comment_url,
+                comment_text_snapshot=text,
+                comment_account_handle=stored_handle,
+                proof_type='URL',
+                paste_event_count=validated_data['pasteCount'],
+                pasted_chars=validated_data['pastedChars'],
+                keypress_count=validated_data['charsTyped'],
+                time_to_compose_seconds=validated_data['elapsedSec'],
+                attestation_signed=validated_data['attestationSigned'],
+                ai_likelihood_score=Decimal('0.0'),
+                status='PENDING',
+            )
 
         ai_score = Decimal('0.0')
-        initial_status = 'PENDING'
-        text = validated_data['text']
-        project = task.project
+        new_status = 'PENDING'
+        project = submission.claim.task.project
         if ai_detection_is_configured():
             try:
                 result = evaluate_for_project(text, project.ai_detection_strictness)
                 if result is not None:
                     ai_score = result.score
                     if result.flagged:
-                        initial_status = 'HELD'
+                        new_status = 'HELD'
             except AIDetectionUnavailable as exc:
                 logger.error(
                     'AI detection unavailable for submission by user=%s on task=%s: %s',
-                    user.id, task.id, exc,
+                    user.id, submission.claim.task_id, exc,
                 )
-                initial_status = 'HELD'
+                new_status = 'HELD'
         elif not project.is_starter:
             logger.warning('AI detection not configured; submitting without score.')
 
-        submission = Submission.objects.create(
-            claim=claim,
-            comment_url=validated_data['commentUrl'],
-            comment_text_snapshot=text,
-            comment_account_handle=(user.handle or user.email.split('@')[0])[:100],
-            proof_type='URL',
-            paste_event_count=validated_data['pasteCount'],
-            pasted_chars=validated_data['pastedChars'],
-            keypress_count=validated_data['charsTyped'],
-            time_to_compose_seconds=validated_data['elapsedSec'],
-            attestation_signed=validated_data['attestationSigned'],
-            ai_likelihood_score=ai_score,
-            status=initial_status,
-        )
-        return submission
-
-
-class SubmissionReviewSerializer(serializers.Serializer):
-    decision = serializers.ChoiceField(choices=['approved', 'rejected'])
-    rating = serializers.IntegerField(min_value=1, max_value=5)
-    justification = serializers.CharField(allow_blank=True, required=False, default='')
-
-    def validate(self, attrs):
-        if attrs['decision'] == 'rejected' and not (attrs.get('justification') or '').strip():
-            raise serializers.ValidationError({'justification': 'Required for rejection'})
-        return attrs
-
-    @transaction.atomic
-    def apply(self, submission: Submission) -> Submission:
-        from accounts.models import User
-        from accounts.notifications import (
-            notify_real_tasks_unlocked,
-            notify_submission_approved,
-            notify_submission_rejected,
-        )
-        decision = self.validated_data['decision']
-        is_approved = decision == 'approved'
-        project = submission.claim.task.project
-        base = project.pay_rate_per_approved_task if is_approved and not project.is_starter else 0
-        submission.status = 'APPROVED' if is_approved else 'REJECTED'
-        submission.rating_final = self.validated_data['rating']
-        submission.justification = self.validated_data.get('justification') or ''
-        submission.reviewed_at = timezone.now()
-        submission.base_payout = base
-        submission.bonus_payout = 0
-        submission.save(update_fields=[
-            'status', 'rating_final', 'justification',
-            'reviewed_at', 'base_payout', 'bonus_payout',
-        ])
-
-        worker = submission.claim.user
-        unlocked_just_now = False
-        if project.is_starter:
-            worker_id = submission.claim.user_id
-            field = 'starter_approved' if is_approved else 'starter_rejected'
-            User.objects.filter(pk=worker_id).update(**{field: F(field) + 1})
-            worker.refresh_from_db(fields=['starter_approved', 'status'])
-            unlocked_just_now = is_approved and worker.real_tasks_unlocked
-
-        if is_approved:
-            notify_submission_approved(submission)
-        else:
-            notify_submission_rejected(submission, self.validated_data.get('justification') or '')
-
-        if unlocked_just_now and not worker.notifications.filter(kind='real_tasks_unlocked').exists():
-            notify_real_tasks_unlocked(worker)
+        if ai_score != Decimal('0.0') or new_status != 'PENDING':
+            with transaction.atomic():
+                Submission.objects.filter(pk=submission.pk).update(
+                    ai_likelihood_score=ai_score,
+                    status=new_status,
+                )
+            submission.refresh_from_db(fields=['ai_likelihood_score', 'status'])
 
         return submission
+
+

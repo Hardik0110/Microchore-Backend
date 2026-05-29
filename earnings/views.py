@@ -1,11 +1,12 @@
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 
-from django.db.models import Count, DecimalField, F, Q, Sum
+from django.db.models import Count, DecimalField, Q, Sum
 from django.db.models.functions import Coalesce
 from rest_framework import permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from earnings.models import Earning
 from submissions.models import Submission
 from submissions.serializers import SubmissionSerializer
 
@@ -35,17 +36,28 @@ class MyEarningsView(APIView):
             approved_count=Count('pk', filter=Q(status='APPROVED')),
             pending_count=Count('pk', filter=Q(status__in=['PENDING', 'IN_REVIEW', 'HELD'])),
             rejected_count=Count('pk', filter=Q(status='REJECTED')),
-            total_earned=Coalesce(
-                Sum(F('base_payout') + F('bonus_payout'), filter=Q(status='APPROVED')),
+        )
+
+        total_earned = Earning.objects.filter(
+            user=request.user,
+            kind__in=['BASE', 'BONUS'],
+            submission__claim__task__project__is_starter=False,
+        ).aggregate(
+            total=Coalesce(
+                Sum('amount'),
                 Decimal('0'),
                 output_field=DecimalField(max_digits=12, decimal_places=4),
             ),
-        )
+        )['total'] or Decimal('0')
 
         ratings = list(
             approved_qs.exclude(rating_final__isnull=True).values_list('rating_final', flat=True)
         )
-        avg_rating = (sum(int(r) for r in ratings) / len(ratings)) if ratings else 0
+        if ratings:
+            mean = sum(Decimal(r) for r in ratings) / Decimal(len(ratings))
+            avg_rating = int(mean.quantize(Decimal('1'), rounding=ROUND_HALF_UP))
+        else:
+            avg_rating = 0
 
         approved_rows = list(approved_qs.order_by('-submitted_at')[:limit])
         latest_rows = list(base_qs.order_by('-submitted_at')[:limit])
@@ -56,7 +68,7 @@ class MyEarningsView(APIView):
             'approvedCount': agg['approved_count'],
             'pendingCount': agg['pending_count'],
             'rejectedCount': agg['rejected_count'],
-            'totalEarned': float(agg['total_earned']),
+            'totalEarned': str(total_earned.quantize(Decimal('0.0001'))),
             'averageRating': avg_rating,
             'approved': approved_payload,
             'latest': approved_payload[0] if approved_payload else None,

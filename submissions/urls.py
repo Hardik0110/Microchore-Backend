@@ -1,8 +1,7 @@
 from django.urls import path
 
-from .views import MySubmissionListCreateView, SubmissionReviewView
+from .views import MySubmissionListCreateView
 
 urlpatterns = [
     path('submissions/', MySubmissionListCreateView.as_view(), name='my-submissions'),
-    path('submissions/<int:pk>/review/', SubmissionReviewView.as_view(), name='submission-review'),
 ]

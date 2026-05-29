@@ -1,13 +1,16 @@
+from datetime import timedelta
 from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APITestCase
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from projects.models import Company, Project, Task
 from submissions.models import Claim, Submission
 from reviews.models import Review, ReviewerStats, Bundle
 from earnings.models import Earning
+from accounts.models import SocialAccount
 
 User = get_user_model()
 
@@ -20,6 +23,19 @@ class SubmissionsAndEarningsApiTests(APITestCase):
             password='testpassword123',
             role='USER',
             handle='testwriter'
+        )
+        # Passed the starter run (>=3 approvals) so it can claim REAL tasks
+        # under the BE-002/BE-010 eligibility gates.
+        self.writer.starter_approved = 3
+        self.writer.save(update_fields=['starter_approved'])
+        # Verified Instagram account so real-task submissions pass the
+        # BE-014 social-account requirement (test comment URLs are instagram.com).
+        SocialAccount.objects.create(
+            user=self.writer,
+            platform='IG',
+            handle='testwriter_ig',
+            verified_at=timezone.now(),
+            is_active=True,
         )
 
         self.reviewer1 = User.objects.create_user(
@@ -112,7 +128,8 @@ class SubmissionsAndEarningsApiTests(APITestCase):
         other_writer = User.objects.create_user(
             username='writer2@test.com',
             email='writer2@test.com',
-            password='testpassword123'
+            password='testpassword123',
+            starter_approved=3,
         )
         self.client.force_authenticate(user=other_writer)
         self.client.post(f'/api/tasks/{self.real_task.id}/claim/')
@@ -124,7 +141,8 @@ class SubmissionsAndEarningsApiTests(APITestCase):
         third_writer = User.objects.create_user(
             username='writer3@test.com',
             email='writer3@test.com',
-            password='testpassword123'
+            password='testpassword123',
+            starter_approved=3,
         )
         self.client.force_authenticate(user=third_writer)
         response = self.client.post(f'/api/tasks/{self.real_task.id}/claim/')
@@ -221,7 +239,7 @@ class SubmissionsAndEarningsApiTests(APITestCase):
         resp3 = self.client.post(f'/api/reviews/submissions/{submission_id}/', r3_payload, format='json')
         self.assertEqual(resp3.status_code, status.HTTP_201_CREATED)
         self.assertEqual(resp3.data['status'], 'approved')
-        self.assertEqual(resp3.data['rating'], 3)
+        self.assertEqual(resp3.data['rating'], 4)
 
         submission = Submission.objects.get(pk=submission_id)
         self.assertAlmostEqual(float(submission.rating_final), 3.67, places=2)
@@ -296,7 +314,14 @@ class SubmissionsAndEarningsApiTests(APITestCase):
         self.assertEqual(submission.status, 'HELD')
 
     def test_peer_review_starter_onboarding_unlocks(self):
-        self.client.force_authenticate(user=self.writer)
+        rookie = User.objects.create_user(
+            username='rookie@test.com',
+            email='rookie@test.com',
+            password='testpassword123',
+            role='USER',
+            handle='rookie',
+        )
+        self.client.force_authenticate(user=rookie)
         sub_resp = self.client.post('/api/submissions/', {
             'taskId': self.starter_task.id,
             'text': 'Starter run onboarding practice task.',
@@ -318,8 +343,8 @@ class SubmissionsAndEarningsApiTests(APITestCase):
         self.client.force_authenticate(user=self.reviewer3)
         self.client.post(f'/api/reviews/submissions/{submission_id}/', {'rating': 4, 'justification_text': 'Perfect keyword integration onboarding practice.'}, format='json')
 
-        self.writer.refresh_from_db()
-        self.assertEqual(self.writer.starter_approved, 1)
+        rookie.refresh_from_db()
+        self.assertEqual(rookie.starter_approved, 1)
 
     def test_reviewer_authorization_enforced(self):
         self.client.force_authenticate(user=self.writer)
@@ -342,3 +367,68 @@ class SubmissionsAndEarningsApiTests(APITestCase):
             'justification_text': 'Trying to bypass authorization review lock.'
         }, format='json')
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+    # ---- Regression tests for the round-2 fixes ----
+
+    def test_locked_worker_cannot_claim_real_task(self):
+        """BE-002/BE-010: a worker who has not passed the starter run is blocked."""
+        rookie = User.objects.create_user(
+            username='locked@test.com', email='locked@test.com',
+            password='testpassword123', role='USER',
+        )
+        self.client.force_authenticate(user=rookie)
+        resp = self.client.post(f'/api/tasks/{self.real_task.id}/claim/')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_reviewer_cannot_review_own_submission(self):
+        """BE-008: the self-review guard rejects reviewing your own submission."""
+        claim = Claim.objects.create(
+            task=self.real_task, user=self.reviewer1, status='SUBMITTED',
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+        submission = Submission.objects.create(
+            claim=claim, status='PENDING',
+            comment_url='https://instagram.com/p/self-review',
+            comment_text_snapshot='My own submission text.',
+            comment_account_handle='reviewer1handle',
+        )
+        self.client.force_authenticate(user=self.reviewer1)
+        resp = self.client.post(f'/api/reviews/submissions/{submission.id}/', {
+            'rating': 5,
+            'justification_text': 'Attempting to review my own submission here.',
+        }, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+    def test_banned_user_cannot_refresh_token(self):
+        """BE-001: a banned account cannot mint new access tokens via refresh."""
+        ok_token = RefreshToken.for_user(self.writer)
+        ok = self.client.post('/api/auth/token/refresh/', {'refresh': str(ok_token)}, format='json')
+        self.assertEqual(ok.status_code, status.HTTP_200_OK)
+
+        banned_token = RefreshToken.for_user(self.writer)
+        self.writer.status = 'BANNED'
+        self.writer.save(update_fields=['status'])
+        resp = self.client.post('/api/auth/token/refresh/', {'refresh': str(banned_token)}, format='json')
+        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_review_pay_unique_per_reviewer(self):
+        """BE-009: a reviewer cannot be paid twice for the same submission."""
+        from django.db import IntegrityError, transaction
+        claim = Claim.objects.create(
+            task=self.real_task, user=self.writer, status='SUBMITTED',
+            expires_at=timezone.now() + timedelta(hours=24),
+        )
+        submission = Submission.objects.create(
+            claim=claim, comment_url='https://instagram.com/p/rp',
+            comment_text_snapshot='text', comment_account_handle='handle',
+        )
+        Earning.objects.create(
+            user=self.reviewer1, project=self.real_project, submission=submission,
+            amount=Decimal('0.0500'), kind='REVIEW_PAY',
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Earning.objects.create(
+                    user=self.reviewer1, project=self.real_project, submission=submission,
+                    amount=Decimal('0.0500'), kind='REVIEW_PAY',
+                )

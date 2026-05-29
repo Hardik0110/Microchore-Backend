@@ -15,10 +15,25 @@ DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
 ALLOWED_HOSTS = [host.strip() for host in os.getenv('ALLOWED_HOSTS', 'localhost,127.0.0.1').split(',') if host.strip()]
 
 if not DEBUG:
-    if not SECRET_KEY or SECRET_KEY in ('changeme', 'django-insecure') or len(SECRET_KEY) < 32:
+    if (
+        not SECRET_KEY
+        or SECRET_KEY in ('changeme',)
+        or SECRET_KEY.startswith('django-insecure')
+        or len(SECRET_KEY) < 32
+    ):
         raise ImproperlyConfigured('SECRET_KEY must be a strong random value (>=32 chars) in production.')
     if '*' in ALLOWED_HOSTS:
         raise ImproperlyConfigured('ALLOWED_HOSTS must not contain "*" in production.')
+    _OWNED_WILDCARD_ALLOWLIST = {
+        h.strip().lower()
+        for h in os.getenv('ALLOWED_HOST_WILDCARD_ALLOWLIST', '').split(',')
+        if h.strip()
+    }
+    for _h in ALLOWED_HOSTS:
+        if _h.startswith('.') and _h.lower() not in _OWNED_WILDCARD_ALLOWLIST:
+            raise ImproperlyConfigured(
+                f'ALLOWED_HOSTS contains wildcard "{_h}" not in ALLOWED_HOST_WILDCARD_ALLOWLIST.'
+            )
 
 FRONTEND_BASE_URL = os.getenv('FRONTEND_BASE_URL', 'http://localhost:5173').rstrip('/')
 BACKEND_BASE_URL = os.getenv('BACKEND_BASE_URL', 'http://127.0.0.1:8000').rstrip('/')
@@ -136,6 +151,24 @@ CORS_ALLOWED_ORIGINS = [origin.strip() for origin in os.getenv('CORS_ALLOWED_ORI
 if not DEBUG and CORS_ALLOW_ALL_ORIGINS:
     raise ImproperlyConfigured('CORS_ALLOW_ALL_ORIGINS must be False in production.')
 
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv('CSRF_TRUSTED_ORIGINS', '').split(',')
+    if origin.strip()
+]
+
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'True').lower() == 'true'
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = int(os.getenv('SECURE_HSTS_SECONDS', '31536000'))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    SECURE_REFERRER_POLICY = 'same-origin'
+    X_FRAME_OPTIONS = 'DENY'
+
 EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
 EMAIL_HOST = os.getenv('EMAIL_HOST', 'localhost')
 EMAIL_PORT = int(os.getenv('EMAIL_PORT', '25'))
@@ -148,7 +181,7 @@ EMAIL_TIMEOUT = int(os.getenv('EMAIL_TIMEOUT', '10'))
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'accounts.authentication.StatusAwareJWTAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
@@ -162,13 +195,25 @@ REST_FRAMEWORK = {
         'user': os.getenv('THROTTLE_USER', '600/min'),
         'auth_signup': os.getenv('THROTTLE_AUTH_SIGNUP', '5/min'),
         'auth_login': os.getenv('THROTTLE_AUTH_LOGIN', '10/min'),
+        'auth_logout': os.getenv('THROTTLE_AUTH_LOGOUT', '10/min'),
+        'auth_refresh': os.getenv('THROTTLE_AUTH_REFRESH', '30/min'),
         'auth_google': os.getenv('THROTTLE_AUTH_GOOGLE', '10/min'),
         'email_verify_request': os.getenv('THROTTLE_EMAIL_VERIFY_REQUEST', '5/min'),
         'email_verify_confirm': os.getenv('THROTTLE_EMAIL_VERIFY_CONFIRM', '20/min'),
+        'submission_create': os.getenv('THROTTLE_SUBMISSION_CREATE', '10/min'),
     },
 }
 
+MICROCHORE_ACTIVE_CLAIM_CAP = int(os.getenv('MICROCHORE_ACTIVE_CLAIM_CAP', '10'))
+
 GOOGLE_OAUTH_CLIENT_ID = os.getenv('GOOGLE_OAUTH_CLIENT_ID', '')
+
+JWT_SIGNING_KEY = os.getenv('JWT_SIGNING_KEY', '').strip() or SECRET_KEY
+
+if not DEBUG and JWT_SIGNING_KEY == SECRET_KEY:
+    raise ImproperlyConfigured(
+        'JWT_SIGNING_KEY must be set to a distinct value from SECRET_KEY in production.'
+    )
 
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(minutes=15),
@@ -177,8 +222,10 @@ SIMPLE_JWT = {
     'BLACKLIST_AFTER_ROTATION': True,
     'UPDATE_LAST_LOGIN': True,
     'ALGORITHM': 'HS256',
-    'SIGNING_KEY': SECRET_KEY,
+    'SIGNING_KEY': JWT_SIGNING_KEY,
     'AUTH_HEADER_TYPES': ('Bearer',),
+    'AUTH_TOKEN_CLASSES': ('rest_framework_simplejwt.tokens.AccessToken',),
+    'USER_AUTHENTICATION_RULE': 'rest_framework_simplejwt.authentication.default_user_authentication_rule',
 }
 
 REDIS_URL = os.getenv('REDIS_URL', '').strip()

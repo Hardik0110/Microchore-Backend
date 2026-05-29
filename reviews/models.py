@@ -11,6 +11,16 @@ class Review(models.Model):
     is_authoritative = models.BooleanField(default=False, help_text="True if this review was the authoritative decision maker")
     created_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        constraints = [
+            # BE-028: a reviewer can submit at most one review per submission.
+            # Defends the consensus count and REVIEW_PAY against double-submit races.
+            models.UniqueConstraint(
+                fields=['submission', 'reviewer'],
+                name='review_unique_per_submission_reviewer',
+            ),
+        ]
+
     def __str__(self):
         return f"Review by {self.reviewer} on {self.submission.id} (Rating: {self.rating})"
 

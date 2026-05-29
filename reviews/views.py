@@ -37,8 +37,19 @@ class ReviewCreateView(APIView):
         except Submission.DoesNotExist:
             return Response({'detail': 'Submission not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-        if submission.status in ('APPROVED', 'REJECTED'):
-            return Response({'detail': 'Submission is already fully reviewed.'}, status=status.HTTP_400_BAD_REQUEST)
+        # BE-008: a worker must never review their own submission. The queue
+        # already excludes own work, but the direct POST endpoint did not.
+        if submission.claim.user_id == request.user.id:
+            return Response(
+                {'detail': 'You cannot review your own submission.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        # BE-007: only PENDING/IN_REVIEW submissions are reviewable. The old
+        # check let HELD (and any non-final) state through, so a 4th reviewer
+        # could mint REVIEW_PAY against an already-escalated submission.
+        if submission.status not in ('PENDING', 'IN_REVIEW'):
+            return Response({'detail': 'Submission is no longer open for review.'}, status=status.HTTP_400_BAD_REQUEST)
 
         if Review.objects.filter(submission=submission, reviewer=request.user).exists():
             return Response({'detail': 'You have already reviewed this submission.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -82,18 +93,24 @@ class ReviewCreateView(APIView):
         count = len(reviews)
 
         if count == 3:
+            # BE-015: consensus decided with integer-exact arithmetic only.
+            # Ratings are integers (1..5), n = 3. Avoid binary float so the
+            # money-affecting approve/hold boundary is deterministic.
             ratings = [r.rating for r in reviews]
-            mean = sum(ratings) / 3.0
-            variance = sum((r - mean) ** 2 for r in ratings) / 3.0
-            stdev = variance ** 0.5
+            rating_sum = sum(ratings)
+            sum_of_squares = sum(r * r for r in ratings)
+            #   variance = (sum_of_squares - rating_sum**2 / n) / n,  n = 3
+            #   variance <= 1.0  <=>  3 * sum_of_squares - rating_sum**2 <= 9
+            low_dispersion = (3 * sum_of_squares - rating_sum * rating_sum) <= 9
             ai_flags = sum(1 for r in reviews if r.feels_ai_flag)
 
             project = submission.claim.task.project
             worker_id = submission.claim.user_id
-            mean_decimal = Decimal(str(round(mean, 2)))
+            mean_decimal = (Decimal(rating_sum) / Decimal(3)).quantize(Decimal('0.01'))
 
-            if stdev <= 1.0 and ai_flags < 2:
-                is_approved = mean >= 3.0
+            if low_dispersion and ai_flags < 2:
+                # mean >= 3.0  <=>  rating_sum >= 9  (n = 3)
+                is_approved = rating_sum >= 9
                 submission.status = 'APPROVED' if is_approved else 'REJECTED'
 
                 sorted_reviews = sorted(reviews, key=lambda r: r.rating)
@@ -117,16 +134,32 @@ class ReviewCreateView(APIView):
                 ])
 
                 if is_approved and base_payout > Decimal('0'):
+                    # BE-004: a submission must never end APPROVED with a
+                    # base_payout but no Earning row. Use a savepoint so the
+                    # IntegrityError only rolls back the failed INSERT, then
+                    # re-query: a genuine duplicate is idempotent (ignore), but
+                    # any other failure re-raises and aborts the whole approval.
                     try:
-                        Earning.objects.create(
-                            user_id=worker_id,
-                            project=project,
-                            submission=submission,
-                            amount=base_payout,
-                            kind='BASE',
-                            status='PENDING_PAYOUT',
-                        )
+                        with transaction.atomic():
+                            Earning.objects.create(
+                                user_id=worker_id,
+                                project=project,
+                                submission=submission,
+                                amount=base_payout,
+                                kind='BASE',
+                                status='PENDING_PAYOUT',
+                            )
                     except IntegrityError:
+                        already_paid = Earning.objects.filter(
+                            submission=submission, kind='BASE',
+                        ).exists()
+                        if not already_paid:
+                            logger.error(
+                                'BASE earning failed for submission=%s worker=%s; '
+                                'rolling back approval to avoid unpaid APPROVED state.',
+                                submission.pk, worker_id,
+                            )
+                            raise
                         logger.warning(
                             'Duplicate BASE earning suppressed for submission=%s worker=%s',
                             submission.pk, worker_id,
@@ -152,9 +185,14 @@ class ReviewCreateView(APIView):
                     )
                     bundle.submissions.add(submission)
                 else:
-                    logger.error(
+                    # BE-023: no ADMIN reviewer to receive the escalation. The
+                    # submission stays HELD (discoverable via status=HELD with
+                    # no OPEN bundle). Logged at CRITICAL so ops alerting can
+                    # page on it. NOTE: a proper AlertEvent sink is still
+                    # required (BE-019) for guaranteed delivery.
+                    logger.critical(
                         'Submission %s escalated to HELD but no ADMIN reviewer exists. '
-                        'Manual intervention required.',
+                        'Manual intervention required — worker payout is blocked until resolved.',
                         submission.pk,
                     )
 

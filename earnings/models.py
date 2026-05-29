@@ -55,6 +55,14 @@ class Earning(models.Model):
                 condition=models.Q(submission__isnull=False) & models.Q(kind__in=['BASE', 'BONUS']),
                 name='earning_unique_payout_per_submission_kind',
             ),
+            # BE-009: REVIEW_PAY is per (submission, reviewer) — one payout per
+            # reviewer per submission. Makes review compensation idempotent
+            # under retries/races (BASE/BONUS are one-per-submission above).
+            models.UniqueConstraint(
+                fields=['submission', 'user', 'kind'],
+                condition=models.Q(submission__isnull=False) & models.Q(kind='REVIEW_PAY'),
+                name='earning_unique_review_pay_per_reviewer',
+            ),
         ]
 
     def __str__(self):

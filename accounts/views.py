@@ -14,9 +14,11 @@ from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.views import APIView
-from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+from rest_framework_simplejwt.serializers import TokenRefreshSerializer
+from rest_framework_simplejwt.settings import api_settings as jwt_settings
 from rest_framework_simplejwt.tokens import RefreshToken
-from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from . import twitter_oauth
 from .models import Notification, SocialAccount
@@ -86,7 +88,7 @@ class EmailTokenObtainPairView(TokenObtainPairView):
 class LogoutView(APIView):
     permission_classes = [permissions.AllowAny]
     throttle_classes = [ScopedRateThrottle]
-    throttle_scope = 'auth_login'
+    throttle_scope = 'auth_logout'
 
     def post(self, request):
         refresh_token = request.data.get('refresh') if isinstance(request.data, dict) else None
@@ -99,8 +101,44 @@ class LogoutView(APIView):
             token = RefreshToken(refresh_token)
             token.blacklist()
         except TokenError:
-            return Response(status=status.HTTP_205_RESET_CONTENT)
-        return Response(status=status.HTTP_205_RESET_CONTENT)
+            return Response(
+                {'detail': 'Invalid or expired refresh token.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except Exception:
+            logger.exception('Unexpected error during logout token blacklist.')
+            return Response(
+                {'detail': 'Logout failed.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(status=status.HTTP_200_OK)
+
+
+class StatusAwareTokenRefreshSerializer(TokenRefreshSerializer):
+    """BE-001: reject token refresh for banned/disabled accounts.
+
+    The default serializer never loads the user, so a BANNED user holding a
+    valid refresh token could otherwise mint fresh access tokens until the
+    refresh token expired (up to 7 days).
+    """
+
+    def validate(self, attrs):
+        token = RefreshToken(attrs['refresh'])  # validates signature/expiry/blacklist
+        user_id = token.get(jwt_settings.USER_ID_CLAIM)
+        User = get_user_model()
+        try:
+            user = User.objects.get(**{jwt_settings.USER_ID_FIELD: user_id})
+        except User.DoesNotExist:
+            raise InvalidToken('No active account found for this token.')
+        if getattr(user, 'status', None) == 'BANNED' or not user.is_active:
+            raise InvalidToken('Account is not permitted to refresh tokens.')
+        return super().validate(attrs)
+
+
+class ThrottledTokenRefreshView(TokenRefreshView):
+    serializer_class = StatusAwareTokenRefreshSerializer
+    throttle_classes = [ScopedRateThrottle]
+    throttle_scope = 'auth_refresh'
 
 
 class EmailVerifyRequestView(APIView):
@@ -150,10 +188,20 @@ class EmailVerifyConfirmView(APIView):
         if not code.isdigit() or len(code) != 6:
             return Response({'detail': 'Invalid code format.'}, status=status.HTTP_400_BAD_REQUEST)
         key = _email_code_cache_key(request.user.id)
+        attempt_key = f'{key}:attempts'
+        attempts = cache.get(attempt_key) or 0
+        if attempts >= 5:
+            cache.delete(key)
+            return Response(
+                {'detail': 'Too many invalid attempts. Request a new code.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         stored = cache.get(key)
         if not stored or stored != _hash_code(code):
+            cache.set(attempt_key, attempts + 1, EMAIL_CODE_TTL_SECONDS)
             return Response({'detail': 'Invalid or expired code.'}, status=status.HTTP_400_BAD_REQUEST)
         cache.delete(key)
+        cache.delete(attempt_key)
         request.user.email_verified = True
         request.user.save(update_fields=['email_verified'])
         return Response(UserSerializer(request.user).data)
@@ -183,17 +231,29 @@ class TwitterCallbackView(APIView):
     permission_classes = [permissions.AllowAny]
     authentication_classes = []
 
-    def _redirect_with(self, status_key, detail=None):
+    _ALLOWED_CODES = {
+        'oauth_error',
+        'missing_code_or_state',
+        'invalid_or_expired_state',
+        'pkce_verifier_missing',
+        'user_not_found',
+        'exchange_failed',
+        'handle_clash',
+        'account_inactive',
+    }
+
+    def _redirect_with(self, status_key, code=None):
         params = [f'twitter={status_key}']
-        if detail:
-            params.append(f'detail={quote(str(detail))[:160]}')
+        if code and code in self._ALLOWED_CODES:
+            params.append(f'code={quote(code)}')
         link_url = f"{settings.FRONTEND_BASE_URL}/onboarding/link-account"
         return redirect(f"{link_url}?{'&'.join(params)}")
 
     def get(self, request):
         err = request.GET.get('error')
         if err:
-            return self._redirect_with('error', request.GET.get('error_description') or err)
+            logger.warning('Twitter callback upstream error: %s', err)
+            return self._redirect_with('error', 'oauth_error')
 
         code = request.GET.get('code')
         state = request.GET.get('state')
@@ -214,11 +274,15 @@ class TwitterCallbackView(APIView):
         except User.DoesNotExist:
             return self._redirect_with('error', 'user_not_found')
 
+        if getattr(user, 'status', None) != 'ACTIVE':
+            return self._redirect_with('error', 'account_inactive')
+
         try:
             tokens = twitter_oauth.exchange_code(code, verifier)
             tw_user = twitter_oauth.fetch_user_info(tokens['access_token'])
-        except ValueError as exc:
-            return self._redirect_with('error', str(exc))
+        except ValueError:
+            logger.exception('Twitter token exchange failed.')
+            return self._redirect_with('error', 'exchange_failed')
 
         username = (tw_user.get('username') or '').strip()
         metrics = tw_user.get('public_metrics') or {}
@@ -241,27 +305,32 @@ class TwitterCallbackView(APIView):
                 age_days = 0
 
         stored_handle = username[:100]
-        clash = (
-            SocialAccount.objects
-            .filter(platform='X', handle=stored_handle)
-            .exclude(user=user)
-            .exists()
-        )
-        if clash:
-            return self._redirect_with('error', f'twitter_handle_@{stored_handle}_already_linked')
-
-        SocialAccount.objects.update_or_create(
-            user=user,
-            platform='X',
-            defaults={
-                'handle': stored_handle,
-                'follower_count': followers,
-                'post_count': tweets,
-                'account_age_days': age_days,
-                'verified_at': timezone.now(),
-                'is_active': True,
-            },
-        )
+        from django.db import IntegrityError, transaction as _tx
+        try:
+            with _tx.atomic():
+                clash = (
+                    SocialAccount.objects
+                    .select_for_update()
+                    .filter(platform='X', handle=stored_handle)
+                    .exclude(user=user)
+                    .exists()
+                )
+                if clash:
+                    return self._redirect_with('error', 'handle_clash')
+                SocialAccount.objects.update_or_create(
+                    user=user,
+                    platform='X',
+                    defaults={
+                        'handle': stored_handle,
+                        'follower_count': followers,
+                        'post_count': tweets,
+                        'account_age_days': age_days,
+                        'verified_at': timezone.now(),
+                        'is_active': True,
+                    },
+                )
+        except IntegrityError:
+            return self._redirect_with('error', 'handle_clash')
 
         return self._redirect_with('linked')
 

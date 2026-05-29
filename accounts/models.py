@@ -34,7 +34,7 @@ class User(AbstractUser):
     country = models.CharField(max_length=2, blank=True, help_text="ISO 2-letter country code")
     fingerprint_hash = models.CharField(max_length=255, blank=True, null=True, db_index=True)
     payout_method = models.CharField(max_length=15, choices=PAYOUT_METHOD_CHOICES, blank=True, null=True)
-    payout_handle = models.CharField(max_length=255, blank=True, null=True, help_text="Encrypted payout identifier")
+    payout_handle = models.CharField(max_length=255, blank=True, null=True, help_text="Payout identifier (stored in plain text; encryption planned)")
 
     handle = models.CharField(max_length=50, blank=True, default='', help_text="Display name shown in UI")
     email_verified = models.BooleanField(default=False)
