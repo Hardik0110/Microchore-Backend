@@ -266,6 +266,7 @@ class LinkYouTubeSerializer(serializers.Serializer):
             )
 
         channel = items[0]
+        channel_id = (channel.get('id') or '').strip()[:64]
         snippet = channel.get('snippet') or {}
         stats = channel.get('statistics') or {}
 
@@ -321,6 +322,7 @@ class LinkYouTubeSerializer(serializers.Serializer):
                     platform='YT',
                     defaults={
                         'handle': stored_handle,
+                        'external_id': channel_id,
                         'follower_count': followers,
                         'post_count': videos,
                         'account_age_days': age_days,
@@ -331,6 +333,69 @@ class LinkYouTubeSerializer(serializers.Serializer):
         except IntegrityError:
             raise serializers.ValidationError({
                 'detail': f'This YouTube channel (@{stored_handle}) is already linked to another Microchore account.',
+            })
+
+        return {
+            'linkedAccount': LinkedAccountSerializer(social).data,
+        }
+
+
+class LinkInstagramSerializer(serializers.Serializer):
+    handle = serializers.CharField(write_only=True, max_length=100)
+
+    def validate(self, attrs):
+        from django.utils import timezone
+        from verification.instagram import verify_profile
+
+        request = self.context.get('request')
+        user = request.user if request else None
+        if user is None or not user.is_authenticated:
+            raise serializers.ValidationError({'detail': 'Not authenticated.'})
+        if getattr(user, 'status', None) != 'ACTIVE':
+            raise serializers.ValidationError({'detail': 'Account is not active.'})
+        if not getattr(user, 'email_verified', False):
+            raise serializers.ValidationError({'detail': 'Verify your email before linking social accounts.'})
+
+        raw_handle = (attrs.get('handle') or '').strip()
+        if not raw_handle:
+            raise serializers.ValidationError({'handle': 'Enter your Instagram username.'})
+
+        result = verify_profile(raw_handle)
+        if not result.ok:
+            raise serializers.ValidationError({'detail': result.error_message})
+
+        stored_handle = (result.handle or raw_handle.lstrip('@')).lower()[:100]
+
+        try:
+            with transaction.atomic():
+                clash = (
+                    SocialAccount.objects
+                    .select_for_update()
+                    .filter(platform='IG', handle=stored_handle)
+                    .exclude(user=user)
+                    .exists()
+                )
+                if clash:
+                    raise serializers.ValidationError({
+                        'detail': f'This Instagram account (@{stored_handle}) is already linked to another Microchore account.',
+                    })
+
+                social, _ = SocialAccount.objects.update_or_create(
+                    user=user,
+                    platform='IG',
+                    defaults={
+                        'handle': stored_handle,
+                        'external_id': result.external_id,
+                        'follower_count': result.follower_count,
+                        'post_count': result.post_count,
+                        'account_age_days': result.account_age_days,
+                        'verified_at': timezone.now(),
+                        'is_active': True,
+                    },
+                )
+        except IntegrityError:
+            raise serializers.ValidationError({
+                'detail': f'This Instagram account (@{stored_handle}) is already linked to another Microchore account.',
             })
 
         return {

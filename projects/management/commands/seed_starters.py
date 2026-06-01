@@ -7,56 +7,59 @@ from django.utils import timezone
 from projects.models import Company, Project, Task
 
 
+PRACTICE_YOUTUBE_URL = 'https://www.youtube.com/watch?v=6MAzUT1YhWE'
+
+
 STARTER_BRIEFS = [
     {
         'name': 'Practice 01 · Morning routines',
         'tone': 'lifestyle',
         'keyword': 'morning routine',
         'brief': (
-            'Reply to our practice post about morning coffee routines. The keyword '
-            '"morning routine" should feel natural in your reply. Friendly, on-topic.'
+            'Leave a comment on this YouTube video about a slow morning vibe. The keyword '
+            '"morning routine" should feel natural in your comment. Friendly, on-topic.'
         ),
-        'url': 'https://instagram.com/p/practice-001',
+        'url': PRACTICE_YOUTUBE_URL,
     },
     {
         'name': 'Practice 02 · Product launch',
         'tone': 'product',
         'keyword': 'launch day',
         'brief': (
-            'React to a new product launch post. Show genuine enthusiasm. '
-            'Keyword: "launch day". Avoid sales-speak.'
+            'Comment on this YouTube video as if it were a product launch reaction. '
+            'Show genuine enthusiasm. Keyword: "launch day". Avoid sales-speak.'
         ),
-        'url': 'https://instagram.com/p/practice-002',
+        'url': PRACTICE_YOUTUBE_URL,
     },
     {
         'name': 'Practice 03 · Weekend prompt',
         'tone': 'story',
         'keyword': 'weekend',
         'brief': (
-            'Reply to a "what is yours?" prompt. Personal voice, conversational. '
-            'Keyword: "weekend".'
+            'Reply to the YouTube video with a personal "what is yours?" style comment. '
+            'Conversational, first-person. Keyword: "weekend".'
         ),
-        'url': 'https://instagram.com/p/practice-003',
+        'url': PRACTICE_YOUTUBE_URL,
     },
     {
         'name': 'Practice 04 · Hot take',
         'tone': 'disagreement',
         'keyword': 'honestly',
         'brief': (
-            'Add nuance to a hot-take post. Disagree gracefully, with reasoning. '
-            'Keyword: "honestly".'
+            'Add nuance to the YouTube video as if responding to a hot take. '
+            'Disagree gracefully, with reasoning. Keyword: "honestly".'
         ),
-        'url': 'https://instagram.com/p/practice-004',
+        'url': PRACTICE_YOUTUBE_URL,
     },
     {
         'name': 'Practice 05 · Brand reply',
         'tone': 'brand',
         'keyword': 'favorite',
         'brief': (
-            'Reply to a brand-style post. Friendly, on-topic, natural keyword integration. '
-            'Keyword: "favorite".'
+            'Comment on this YouTube video in a brand-friendly tone. On-topic, natural '
+            'keyword integration. Keyword: "favorite".'
         ),
-        'url': 'https://instagram.com/p/practice-005',
+        'url': PRACTICE_YOUTUBE_URL,
     },
 ]
 

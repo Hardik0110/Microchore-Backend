@@ -25,6 +25,7 @@ from .models import Notification, SocialAccount
 from .serializers import (
     EmailTokenObtainPairSerializer,
     GoogleSignInSerializer,
+    LinkInstagramSerializer,
     LinkYouTubeSerializer,
     NotificationSerializer,
     SignupSerializer,
@@ -212,6 +213,15 @@ class LinkYouTubeView(APIView):
 
     def post(self, request):
         serializer = LinkYouTubeSerializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        return Response(serializer.validated_data, status=status.HTTP_200_OK)
+
+
+class LinkInstagramView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = LinkInstagramSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         return Response(serializer.validated_data, status=status.HTTP_200_OK)
 

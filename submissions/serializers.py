@@ -173,6 +173,27 @@ class SubmissionCreateSerializer(serializers.Serializer):
                 social_account = self._verify_social_account(
                     user, comment_url, validated_data.get('socialAccountId'),
                 )
+                if social_account and social_account.platform == 'YT':
+                    from verification.youtube_comment import verify_comment, extract_video_id
+                    target_video_id = extract_video_id(
+                        task.target_post_url or project.target_post_url_default or ''
+                    )
+                    result = verify_comment(
+                        comment_url=comment_url,
+                        expected_channel_id=social_account.external_id or '',
+                        expected_video_id=target_video_id,
+                    )
+                    if not result.ok:
+                        raise serializers.ValidationError({'commentUrl': result.error_message})
+                if social_account and social_account.platform == 'IG':
+                    from verification.instagram import verify_comment as verify_ig_comment
+                    ig_result = verify_ig_comment(
+                        comment_url=comment_url,
+                        expected_handle=social_account.handle or '',
+                        expected_text=text,
+                    )
+                    if not ig_result.ok:
+                        raise serializers.ValidationError({'commentUrl': ig_result.error_message})
 
             if project.is_starter:
                 if task.status != 'OPEN' or task.remaining_count <= 0:

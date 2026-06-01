@@ -208,6 +208,12 @@ MICROCHORE_ACTIVE_CLAIM_CAP = int(os.getenv('MICROCHORE_ACTIVE_CLAIM_CAP', '10')
 
 GOOGLE_OAUTH_CLIENT_ID = os.getenv('GOOGLE_OAUTH_CLIENT_ID', '')
 
+YOUTUBE_API_KEY = os.getenv('YOUTUBE_API_KEY', '').strip()
+
+APIFY_API_TOKEN = os.getenv('APIFY_API_TOKEN', '').strip()
+APIFY_IG_PROFILE_ACTOR = os.getenv('APIFY_IG_PROFILE_ACTOR', 'apify~instagram-profile-scraper').strip()
+APIFY_IG_COMMENT_ACTOR = os.getenv('APIFY_IG_COMMENT_ACTOR', 'apify~instagram-comment-scraper').strip()
+
 JWT_SIGNING_KEY = os.getenv('JWT_SIGNING_KEY', '').strip() or SECRET_KEY
 
 if not DEBUG and JWT_SIGNING_KEY == SECRET_KEY:

@@ -63,6 +63,7 @@ class SocialAccount(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='social_accounts')
     platform = models.CharField(max_length=15, choices=PLATFORM_CHOICES)
     handle = models.CharField(max_length=100)
+    external_id = models.CharField(max_length=64, blank=True, default='', db_index=True)
     verified_at = models.DateTimeField(null=True, blank=True)
     follower_count = models.IntegerField(default=0)
     post_count = models.IntegerField(default=0)
