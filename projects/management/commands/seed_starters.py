@@ -7,9 +7,6 @@ from django.utils import timezone
 from projects.models import Company, Project, Task
 
 
-PRACTICE_YOUTUBE_URL = 'https://www.youtube.com/watch?v=6MAzUT1YhWE'
-
-
 STARTER_BRIEFS = [
     {
         'name': 'Practice 01 · Morning routines',
@@ -19,7 +16,7 @@ STARTER_BRIEFS = [
             'Leave a comment on this YouTube video about a slow morning vibe. The keyword '
             '"morning routine" should feel natural in your comment. Friendly, on-topic.'
         ),
-        'url': PRACTICE_YOUTUBE_URL,
+        'url': 'https://www.youtube.com/watch?v=6MAzUT1YhWE',
     },
     {
         'name': 'Practice 02 · Product launch',
@@ -29,7 +26,7 @@ STARTER_BRIEFS = [
             'Comment on this YouTube video as if it were a product launch reaction. '
             'Show genuine enthusiasm. Keyword: "launch day". Avoid sales-speak.'
         ),
-        'url': PRACTICE_YOUTUBE_URL,
+        'url': 'https://www.youtube.com/watch?v=A4WgT0QOXhs&list=RDA4WgT0QOXhs',
     },
     {
         'name': 'Practice 03 · Weekend prompt',
@@ -39,7 +36,7 @@ STARTER_BRIEFS = [
             'Reply to the YouTube video with a personal "what is yours?" style comment. '
             'Conversational, first-person. Keyword: "weekend".'
         ),
-        'url': PRACTICE_YOUTUBE_URL,
+        'url': 'https://www.youtube.com/watch?v=dQw4w9WgXcQ',
     },
     {
         'name': 'Practice 04 · Hot take',
@@ -49,7 +46,7 @@ STARTER_BRIEFS = [
             'Add nuance to the YouTube video as if responding to a hot take. '
             'Disagree gracefully, with reasoning. Keyword: "honestly".'
         ),
-        'url': PRACTICE_YOUTUBE_URL,
+        'url': 'https://www.youtube.com/watch?v=9bZkp7q19f0',
     },
     {
         'name': 'Practice 05 · Brand reply',
@@ -59,7 +56,7 @@ STARTER_BRIEFS = [
             'Comment on this YouTube video in a brand-friendly tone. On-topic, natural '
             'keyword integration. Keyword: "favorite".'
         ),
-        'url': PRACTICE_YOUTUBE_URL,
+        'url': 'https://www.youtube.com/watch?v=JGwWNGJdvx8',
     },
 ]
 
@@ -106,7 +103,8 @@ class Command(BaseCommand):
             )
 
             if not was_new:
-                if not project.tasks.exists():
+                task = project.tasks.first()
+                if not task:
                     Task.objects.create(
                         project=project,
                         status='OPEN',
@@ -118,7 +116,18 @@ class Command(BaseCommand):
                     )
                     self.stdout.write(f"  Added missing task to existing project: {project.name}")
                 else:
-                    skipped += 1
+                    updated = False
+                    if task.target_post_url != entry['url']:
+                        task.target_post_url = entry['url']
+                        updated = True
+                    if task.keyword != entry['keyword']:
+                        task.keyword = entry['keyword']
+                        updated = True
+                    if updated:
+                        task.save()
+                        self.stdout.write(f"  Updated task details for existing project: {project.name}")
+                    else:
+                        skipped += 1
                 continue
 
             Task.objects.create(
@@ -131,7 +140,7 @@ class Command(BaseCommand):
                 expires_at=expires,
             )
             created += 1
-            self.stdout.write(self.style.SUCCESS(f"  Created starter project + task: {project.name}"))
+            self.style.SUCCESS(f"  Created starter project + task: {project.name}")
 
         self.stdout.write(
             self.style.SUCCESS(f"Done. Created {created} new starter project(s), skipped {skipped} existing.")
