@@ -7,7 +7,10 @@ from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-load_dotenv(os.path.join(BASE_DIR, '.env'))
+env_path = os.path.join(BASE_DIR, '.env')
+if not os.path.exists(env_path):
+    env_path = os.path.join(BASE_DIR, '.env.production')
+load_dotenv(env_path)
 
 SECRET_KEY = os.environ['SECRET_KEY']
 DEBUG = os.getenv('DEBUG', 'False').lower() == 'true'
